@@ -1,0 +1,1287 @@
+# **MODELLING DRAGONFLY OCCUPANCY IN CUMBRIA**
+
+Written by Kiran Dhanjal-Adams on 2/02/2017
+
+
+**************************
+## Background
+**************************
+
+This code is for the Hydroscape NERC project NEC05609.
+  
+This code takes BRC (Biological Records Center) observation/non-observation data of 18 species of dragonfly and models their likelihood of occupying a cell/grid/site based on a state-space model. The probability of a cell being occupied is thus depedent on detection probability. I use covariates in both the state and the space models. In the state model, water 'type' is used to model occurence (z). Thus if there is a lot of water flowing  into a cell, it means that some species  may be more likely to occur there. Similarly, I have incorporated the proportion of water in that cell, and the proportion of bog in that cell. This is also a multi-species model, which means that slope  parameters can be fit for groups of species. This means the model is much faster to converge as species are sharing parameters. For instance some species are known to prefer bogs - species that are categorised as liking bogs share a slope for occurence around bogs.
+
+I have also included a variable indicator selection. This means that for each covariate, beta/slope is dependent on a coin flip. If that variable explains the occurence pattern well, it will have a high 'weight'.
+
+Finally, in the detection model, I use list length (number of species seen during that count) and visit length (number of times a site was visited) to explain how well we are at detecting a species. Thus, if we've been to a site a lot and not seen the species, then we are more certain that it's not there, than if we only went there once and didn't see it. Similarly, if we recoreded lots of species during a visit, we can assume the person carrying out the survey is better at detecting dragonflies. Finally, I also make the assumption that dragonflies that are bigger are more likely to be detected and that dragonflies which have a longer flying season are more likely to be detected.
+
+**************************
+## Setting up the workspace
+**************************
+
+Clear R workspace so no other variables interfere with the anlaysis.
+
+```{r}
+# clear R
+rm(list=ls()) 
+```
+
+Set the working directory.
+
+```{r}
+setwd("C:/Users/KIRADHA/Documents/Hydroscape/code/transfer/test7/")
+```
+
+Name the files that will save the results from the simulation.
+
+```{r}
+pdf_filename = "test7.pdf"
+txt_filename = "test7.txt"
+R_filename   = "test7.Rdata"
+```
+
+Load libraries
+
+```{r loadlib, warning=FALSE, message = FALSE}
+library(reshape2)
+library(R2jags)
+library(lme4)
+library(ggplot2)
+library(car)
+library(plyr)
+library(dplyr)
+library(snow)         # for parallel processing
+library(dclone)       # package for running jags in parallel
+library(BRCmap)       # got this as zip from Colin Harrower
+```
+
+**************************
+## Loading the data
+**************************
+
+Here the data used is a combination of dragonfly observations in Cumbria, the traits associated with those dragonfly species and finally the land cover map data for the gridcells in Cumbria with information such as the proportion of water in a gridcell, etc...
+
+```{r}
+# dragonfly occurences in cumbria (name of dataframe is "cumbria2")
+load("C:/Users/KIRADHA/Documents/Hydroscape/code/occ models/cumbria.RData")
+Dragonfly <- cumbria2
+rm(cumbria2)
+
+# dragonfly traits
+traits <- read.csv("C:/Users/KIRADHA/Documents/Hydroscape/dragonfly data/Odonata_traits_single.csv")
+
+# land cover map 2007
+lcm2007 <- read.csv("C:\\Users\\KIRADHA\\Documents\\Hydroscape\\bng_area_2_shp.csv")
+
+# check the data is loaded 
+ls()
+```
+
+**************************
+## Setup occurence data
+**************************
+
+Put it all together into a smaller dataset.
+
+```{r}
+occurences <- Dragonfly[,c("1 km Square","EndDate","Taxon Name")]
+names(occurences) <- c("site","date","taxa")
+# remove to save space
+rm(Dragonfly)
+```
+
+Make sure there are no NAs
+
+```{r}
+occurences <- occurences[complete.cases(occurences),]
+dim(occurences)
+```
+
+Get rid of replicates/duplicates
+
+```{r}
+x <- duplicated(occurences)
+x <- ifelse(x == TRUE,FALSE,TRUE)
+occurences <- occurences[x,]  
+dim(occurences)
+
+### To be removed later - only use 3 species to get it going
+#spp_to_use = 3
+#occurences <- occurences[which(occurences$taxa %in% unique(occurences$taxa)[1:spp_to_use]),]
+
+# Number of species
+nspecies=length(unique(factor(occurences$taxa)))
+
+# add list length column
+occurences$visit <- paste(occurences$site, occurences$date, sep="") # create a factor which combines date and site
+visit_Ls <- as.data.frame(table(occurences$visit))
+names(visit_Ls) <- c("visit", "L")
+occurences <- merge(occurences, visit_Ls)
+head(occurences)
+
+# create a site-species index
+occurences$site_spp <- paste(occurences$site, occurences$taxa, sep="") # create a factor which combines date and site
+
+# create species_visit dataframe/matrix
+temp <- occurences[,c('taxa','visit')]
+names(temp)[1] <- "species_name"
+```
+
+Add TRUE column which will populate the spp with visit matrix/dataframe
+
+```{r}
+temp$pres <- TRUE 
+```
+
+This is the dataframe that contains a row per visit and a column for each species present or not.  USed to create the focal column in the next step.
+
+```{r}
+spp_vis <- dcast(temp, formula = visit ~ species_name, value.var = "pres", fill = FALSE) 
+```
+
+Create occDetdata which is the main file sent to bugs (1 row per visist) - this will have "focal" added to it within the species loop
+
+```{r}
+occDetdata <- unique(occurences[,c("visit", "site", "L", "date", "taxa","site_spp")])
+taxa_name = levels(factor(occurences$taxa)) # [1]
+occDetdata <- merge(occDetdata, spp_vis[,c("visit", taxa_name)])
+```
+
+Remove taxa columns as it is redundant and confusing
+
+```{r}
+occDetdata <- occDetdata[ , -which(names(occDetdata) %in% c("taxa"))]
+```
+
+Remove any repetitions
+
+```{r}
+occDetdata <- occDetdata[ifelse(duplicated(occDetdata) == TRUE,FALSE,TRUE),]
+dim(occDetdata)
+```
+
+Melt it into 1
+
+```{r}
+occDetdata <- melt(occDetdata, id.vars=c("visit","site","L","date","site_spp"),var='taxa')
+names(occDetdata) <- c("visit","site","L","date","site_spp","taxa","obs")
+occDetdata$obs <- as.numeric(occDetdata$obs)
+```
+
+Add visits per site column
+
+```{r}
+visit_sites<- as.data.frame(table(factor(occDetdata$site))/nspecies) 
+names(visit_sites) <- c("site","V")
+occDetdata <- merge(occDetdata,visit_sites,by.y="site")
+
+#Checkout what that column looks like
+head(occDetdata$V)
+
+# make sure there are no 1s in there
+unique(occDetdata$V)
+```
+
+Re-order the columns
+
+```{r}
+occDetdata <- occDetdata[,c("visit","site","date","L","V","site_spp",
+                            "taxa","obs")]
+```
+
+Order the data by visit to later create a column counting which site visit each visit is (3rd time that site is visited?)
+
+```{r}
+occDetdata <- occDetdata[order(occDetdata$visit),] 
+```
+
+Make it all numeric so they can be used by JAGS
+
+```{r}
+occDetdata$Numvisit <- as.numeric(as.factor(occDetdata$visit))
+occDetdata$Numsite <- as.numeric(factor(occDetdata$site))
+occDetdata$Numtaxa <- as.numeric(factor(occDetdata$taxa))
+```
+
+Add a column with visit number
+
+```{r}
+occDetdata$NumV <- with(occDetdata, ave(seq(site), site, FUN = function(x) ceiling(seq(length(x))/18)))
+```
+
+Add levels to the data so that if there's 1 visit to a site, p is different from when there are 2-5 visits or >5 visits
+
+```{r}
+occDetdata$maxV<-2
+occDetdata$maxV[occDetdata$V == 1]<-1
+occDetdata$maxV[occDetdata$V >5]<-3
+```
+
+Make sure it looks as it should
+
+```{r}
+head(occDetdata)
+```
+
+*******************
+## Setup covariate data
+*******************
+
+Remove unwanted columns (had to look up what values represented for land cover map)
+
+```{r}
+lcm2007 <- lcm2007[,c("PLAN_NO","GRID_CODE","VALUE_16","VALUE_12","VALUE_9")]
+names(lcm2007) <- c("site","Water_inflow","Freshwater","Bog","Marsh")
+```
+
+Add covariate data to the occupancy data
+
+```{r}
+occDetdata <- merge(occDetdata,lcm2007)
+
+inflow <- cbind(occDetdata$Numsite,occDetdata$Water_inflow)
+inflow <- inflow[ifelse(duplicated(inflow) == TRUE,FALSE,TRUE),][,2]
+
+freshwater <- cbind(occDetdata$Numsite,occDetdata$Freshwater)
+freshwater <- freshwater[ifelse(duplicated(freshwater) == TRUE,FALSE,TRUE),][,2]
+
+bog <- cbind(occDetdata$Numsite,occDetdata$Bog)
+bog <- bog[ifelse(duplicated(bog) == TRUE,FALSE,TRUE),][,2]
+```
+
+*****************
+## Setup trait data
+*****************
+
+```{r}
+names(traits)[1] <- "taxa"
+
+# remove species from the data which are not included in the analysis
+traits <- traits[traits$taxa %in% occDetdata$taxa,]
+
+#get rid of columns with NAs as we cannot use them
+traits <- traits[ , colSums(is.na(traits)) == 0]
+
+#order according to taxa_name so that it lines up with occDetdata levels
+traits <- traits[c(unique(factor(occDetdata$taxa))),]
+
+#traits$distribution <- as.numeric(factor(traits$Distribution_status))
+# could use the above line to create numerical factor levels but I prefer to order them by how widespread they are
+traits$distribution <- factor(traits$Distribution_status)
+traits$distribution <- ifelse(traits$Distribution_status == "Scarce", 1, traits$distribution)
+traits$distribution <- ifelse(traits$Distribution_status == "Local", 2, traits$distribution)
+traits$distribution <- ifelse(traits$Distribution_status == "Widespread", 3, traits$distribution)
+traits$distribution <- ifelse(traits$Distribution_status == "Very widespread", 4, traits$distribution)
+```
+
+*****************
+## Write JAGS model
+*****************
+
+This is where the state space model is formulated for JAGS. Note the terminology is very similar to R. There is an observation model with detection probability o influences the occupancy z of a site. 
+
+I've commented out a little bit of code. In some cases, it is better to formulate the code as a string (R preferers it, particularly when using a t distribution). But currently works so am keeping it in this format as Rstudio uses different colours to highlight comments, etc...
+
+
+```{r}
+# This commented out bit is a different way of running in jags, particularly oif using a half cauchy distribution
+#sink("C:/Users/KIRADHA/Documents/Hydroscape/code/transfer/test7/test7.jags")
+#cat("
+
+
+occDetBUGScode <- function(){  
+  
+  #~~~~~~~~~~~~ OBSERVATION MODEL PRIORS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  
+  # random species effect
+  for(s in 1:nspecies){
+    alpha.p[s] ~ dnorm(mu.lp, tau.lp)            
+  }
+  # hyperpriors
+  mu.lp ~ dnorm(0, 0.01)                         
+  tau.lp <- 1 / (sd.lp * sd.lp)                 
+  sd.lp ~ dunif(0, 5)
+  
+  # list length effect
+  plistlength ~ dunif(-10,10)
+  
+  # visit effect
+  pvisitlength ~ dunif(-10,10)
+  
+  # size of the
+  psize ~ dunif(-10,10)
+  
+  # flight duration
+  pflight ~ dunif(-10,10)
+  
+  #~~~~~~~~~~~~ STATE MODEL PRIORS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  
+  for (h in 1:3){
+    theta.inflow.habitat[h] ~  dunif(-10,10)
+    ind.inflow.habitat[h]   ~  dbern(0.5)
+    
+    theta.water.habitat[h] ~  dunif(-10,10)
+    ind.water.habitat[h]   ~  dbern(0.5)
+    
+    theta.bog.habitat[h] ~  dunif(-10,10)
+    ind.bog.habitat[h]   ~  dbern(0.5)
+  }
+  
+  for (h in 1:3){
+    beta.inflow.habitat[h]  <- theta.inflow.habitat[h] * ind.inflow.habitat[h]
+    beta.water.habitat[h]  <- theta.water.habitat[h] * ind.water.habitat[h]
+    beta.bog.habitat[h]  <- theta.bog.habitat[h] * ind.bog.habitat[h]
+  }
+  
+  for(s in 1:nspecies){  
+    # covariates
+    theta.inflow[s] ~ dunif(-10,10)
+    theta.water[s]  ~ dunif(-10,10)
+    theta.bog[s]    ~ dunif(-10,10)
+    
+    # covariate selection indicator (from mushinda et al. 2013?)
+    # Basically you do a coing flip and this decides whether or not you use that variable to explaine occupancy
+    ind.inflow[s] ~ dbern(0.5)
+    ind.water[s]  ~ dbern(0.5)
+    ind.bog[s]    ~ dbern(0.5)
+  }
+  
+  # species loop
+  for(s in 1:nspecies){
+    #covariate slopes
+    beta.inflow[s]  <- theta.inflow[s] * ind.inflow[s]
+    beta.water[s]  <- theta.water[s] * ind.water[s]
+    beta.bog[s]  <- theta.bog[s] * ind.bog[s]
+    
+    # species intercept
+    alpha.z[s] ~ dnorm(mu.alpha, tau.alpha) 
+  }
+  #Hyperpriors for alpha.z
+  mu.alpha ~ dnorm(0, 0.01)                         
+  tau.alpha <- 1 / (sd.alpha * sd.alpha)                 
+  sd.alpha ~ dunif(0, 5) 
+  
+  # random site effect
+  for (i in 1:nsite) {
+    eps[i] ~ dnorm(0, tau.eps) 
+  } 
+  # hyperpriors
+  tau.eps <- 1/(sigma.eps * sigma.eps)
+  sigma.eps ~ dunif(0, 5)
+  
+  #~~~~~~~~~~~~ STATE MODEL ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  
+  # loop through every line of the dataset  
+  for(s in 1:nspecies){
+    for(i in 1:nsite){
+      # True occupancy 
+      z[i,s] ~ dbern(muZ[i,s])
+      # muZ is dependent on spp intercept, species specific covariate and random site effect
+      logit(muZ[i,s]) <- alpha.z[s] 
+      + beta.inflow.habitat[habitat[s]] * Water_inflow[i] 
+      + beta.water.habitat[habitat[s]] * Freshwater[i] 
+      + beta.bog.habitat[habitat[s]] * Bog[i]
+      + ind.inflow[s] * beta.inflow[s] * Water_inflow[i] 
+      + ind.water[s] * beta.water[s] * Freshwater[i] 
+      + ind.bog[s] * beta.bog[s] * Bog[i] 
+      + eps[i]
+    }
+  }
+  
+  #~~~~~~~~~~~~ OBSEVATION MODEL ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  
+  # loop through every line of the dataset
+  for(j in 1:length) {
+    
+    # observations are a coin flip of Py
+    y[j] ~ dbern(Py[j])
+    # Py is what was really there * detection probability
+    Py[j] <- z[site[j],species[j]]*p[j] 
+    # detection probability has a species effect, a list length effect 
+    # and a visit effect
+    logit(p[j]) <-  alpha.p[species[j]] 
+    + plistlength*logL[j] 
+    + pvisitlength*logV[j]
+    + psize * size[species[j]]
+    + pflight * flight_duration[species[j]]
+    
+    #Generate replicate datato later compute fit stats for them
+    Presi[j] <- abs(y[j]-p[j])
+    y.new[j] ~ dbern(Py[j]) 
+    Presi.new[j] <- abs(y.new[j]-p[j])
+    
+  }
+  
+  # Bayesian Goodness-of-Fit
+  fit <- sum(Presi[])
+  fit.new <- sum(Presi.new[])
+  
+  #~~~~~~~~~~~~ DERIVED PARAMETERS~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  
+  # Finite sample occupancy - average species occupancy over all sites
+  for (s in 1:nspecies) {  
+    psi[s] <- sum(z[1:nsite,s])/nsite
+  } 
+  
+  # Derived parameters observation model - species detection
+  for (s in 1:nspecies) {          
+    pdet.alpha[s] <- exp(alpha.p[s])/(1 + exp(alpha.p[s])) 
+  }
+  
+}
+
+
+# ", fill = TRUE)
+# sink()
+
+model.file = occDetBUGScode
+# model.file = "C:/Users/KIRADHA/Documents/Hydroscape/code/transfer/test5_cumbria.jags"
+```
+
+*********
+## Setup JAGS simulations
+*************
+
+Now that the model has been formulated, the next step consists of telling the model which variables to use, how to initiate them, and then what it should to output.
+
+First, I start by making sure it's random
+
+```{r}
+seed = NULL
+set.seed(seed)
+```
+
+Figure out which species is at which site to input in JAGS (i.e. create z to initiate bugs)
+
+```{r}
+Z <- acast(occDetdata, formula= Numsite ~ Numtaxa, value.var="obs",max)
+```
+
+Create lookup for numbers and names (for later - so we know what 1, 2, 3 stand for)
+
+```{r}
+taxa_name = unique(factor(occDetdata$taxa))
+taxa_num = unique(factor(occDetdata$Numtaxa))
+site_name = unique(factor(occDetdata$site))
+site_num = unique(factor(occDetdata$Numsite))
+```
+
+Pre-define parameters for BUGS
+
+```{r}
+nspecies = length(unique(occDetdata$Numtaxa))
+nsite = length(unique(occDetdata$Numsite)) 
+nvisit = length(unique(occDetdata$Numvisit))
+length = nrow(occDetdata)
+```
+
+Here is JAGS data input.
+
+Note there are some lines commented out, these are covariates and categorical variables that could be used in the analysis, but which I've not. For instance, listl lenght is currently used as a continuous variable, but should be used as a categorical one to account for the fact that there are less species in Scotland than in England,etc... Categories would for instance be - list length of 1, in category 1, list length of 2-4 in category 2 and finally, anything longer as category 3.
+
+```{r}
+bugs_data <- with(occDetdata, # adds rownum to occDetdata (used below)
+                  list(y = obs,                     # Actual observations/occurences
+                       species = Numtaxa,           # Species number in numeric form  
+                       site = Numsite,              # Site number in numeric form 
+                       nspecies = nspecies,         # Number of species 
+                       nsite = nsite,               # Number of sites
+                       # SiteVis_Counter = NumV,    # this is the nth visit made to a site
+                       # SiteVis_Category = maxV,   # this is a categorical variable for the number of times a site is visited
+                       # SiteVis_MaxNum = V,        # this is the number of visits made at each site for each species
+                       # nvisit = nvisit,           # number of unique identifiers for site-date
+                       logL=log(L),                           # coninuous list length
+                       logV = log(V),                         # continuous visit length
+                       Water_inflow = log(inflow+0.0000001),  # volume of water flowing into cell
+                       Freshwater = log(freshwater+0.0000001),# percentage freshwater in cell
+                       Bog = log(bog+0.0000001),              # percentage bog in cell
+                       length = length,                       # size of dataset
+                       size = (traits$Body_size_median - mean(traits$Body_size_median))/mean(traits$Body_size_median),
+                       flight_duration = (traits$Flight_period_duration- mean(traits$Flight_period_duration))/mean(traits$Flight_period_duration),
+                       # migrant = as.numeric(traits$Migratory),#ifelse(traits$Migratory == "N",0,1),
+                       # distribution = traits$distribution, 
+                       # oviposition = as.numeric(traits$Oviposition), 
+                       habitat = as.numeric(traits$breeding_habitat)
+                  )
+)
+```
+
+Define which initial values are required
+
+```{r}
+n_iterations = 3000   #5000   # old values, too long to run for testing phase
+burnin = 1500         #1500 
+thinning = 2          #3
+n_chains = 3
+write_results = TRUE
+output_dir = getwd()
+```
+
+Set the initial values 
+
+```{r}
+init = list(z=Z, 
+            alpha.p=runif(nspecies,-2,2), 
+            alpha = runif(nspecies,-2,2),
+            eps = runif(nsite,0,1))
+
+init.vals <- replicate(n_chains, init,
+                       simplify = F)
+```
+
+Set the parameters for JAGS to monitor and "remember" once simulation is finished
+
+```{r}
+parameters <- c("z","fit", "fit.new", "psi", "pdet.alpha", 
+                "alpha.p", "plistlength", "pvisitlength", "psize", "pflight",
+                "alpha.z" , "theta.inflow", "theta.water", "theta.bog",
+                "ind.inflow","ind.water","ind.bog",
+                "beta.inflow", "beta.water", "beta.bog", 
+                "theta.bog.habitat", "theta.water.habitat","theta.inflow.habitat",
+                "ind.bog.habitat", "ind.water.habitat","ind.inflow.habitat",
+                "beta.bog.habitat", "beta.water.habitat","beta.inflow.habitat",
+                "eps")
+```
+
+************
+## Setup local parallel processing and run JAGS
+*************
+
+```{r run, warning=FALSE}
+# create a group of 3 local processors, called "cl"
+cl = makeCluster(type = "SOCK", rep("localhost",3)) # must have 3 processors or threads on your computer               
+
+# Run JAGS
+out <- R2jags::jags(bugs_data, init.vals, parameters, model.file = model.file,
+                    n.chains = n_chains, n.iter = n_iterations, n.thin = thinning,
+                    n.burnin = burnin, DIC = TRUE)
+
+# stop cluster
+stopCluster(cl) 
+
+# Look at the data
+# out
+```
+
+**************
+# **Visulising results**
+***************
+
+### Plot to pdf
+
+```{r}
+# comment out this section if you don't want to save the data
+
+# open the pdf and specify it's size
+pdf(pdf_filename,width=6,height=4)
+```
+
+Summarise mcmc object
+
+```{r}
+out.mc <- as.mcmc(out)
+out.mc.list <- as.mcmc.list(out.mc)
+#par(mfrow = c( 2, 2), mar =c(5,5,4,4))
+#plot(out.mc.list, trace = TRUE, density = TRUE, smooth = FALSE,auto.layout = F)
+```
+
+
+## Evaluate model fit
+
+```{r}
+# make it one graph per screen
+par(mfrow = c( 1, 1), mar =c(5,5,4,4))
+
+fit<-out$BUGSoutput$sims.list$fit
+fit.new<-out$BUGSoutput$sims.list$fit.new
+plot(out$BUGSoutput$sims.list$fit,out$BUGSoutput$sims.list$fit.new,
+     main="",xlab="Discrepency in actual data",
+     ylab="Discrepancy in replicate data",
+     frame.plot=FALSE)
+abline(0,1,lwd=2,col="red")
+mean(out$BUGSoutput$sims.list$fit.new>out$BUGSoutput$sims.list$fit)
+mean(out$BUGSoutput$sims.list$fit)/mean(out$BUGSoutput$sims.list$fit.new)
+```
+
+
+## Plot average species occupancy
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(9,4,1,1))
+
+# format data for plotting
+psi.fitted<-apply(out$BUGSoutput$sims.list$psi,2,mean)
+psi.lower.CI<-apply(out$BUGSoutput$sims.list$psi,2,quantile,probs=0.025)
+psi.upper.CI <-apply(out$BUGSoutput$sims.list$psi,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,psi.fitted,
+     ylab="Average occupancy",xlab="",xaxt = "n",
+     type ="p", ylim=c(0,1),
+     pch=16,frame.plot = FALSE)
+segments(1:nspecies,psi.lower.CI,1:nspecies,psi.upper.CI)
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+**************
+## Plot covariates for each species
+**************
+
+
+
+
+### Volume of water flowing into cell
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(13,4,1,1))
+```
+
+#### Beta
+
+Beta is the slope parameter. If it's confidence intervals do not overlap 0, then it can be deemed important. Note that beta = theta * indicacor. Both of which are below. The indicator determines whther the variable is used in the analysis or not, which is why most thetas range from -10 to 10. The model simply decides not to use them so they are not included in the model and are not estimated.
+
+```{r}
+# format data for plotting
+water.fitted   <- apply(out$BUGSoutput$sims.list$beta.water,2,mean)
+water.lower.CI <- apply(out$BUGSoutput$sims.list$beta.water,2,quantile,probs=0.025)
+water.upper.CI <- apply(out$BUGSoutput$sims.list$beta.water,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,water.fitted,
+     ylab="Proporion of water slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:nspecies, rep(0,nspecies),col="red")
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,water.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,water.lower.CI,1:nspecies,water.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+
+
+#### Theta
+
+When theta ranges from -10 to 10, it's because the indicator variable is non-important. This is because they are not estimated as deemed not useful in explaining occupancy in the model.
+
+```{r}
+# format data for plotting
+water.fitted   <- apply(out$BUGSoutput$sims.list$theta.water,2,mean)
+water.lower.CI <- apply(out$BUGSoutput$sims.list$theta.water,2,quantile,probs=0.025)
+water.upper.CI <- apply(out$BUGSoutput$sims.list$theta.water,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,water.fitted,
+     ylab="Proporion of water slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:nspecies, rep(0,nspecies),col="red")
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,water.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,water.lower.CI,1:nspecies,water.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Indicator
+
+If the indicator variable is >0.75 (i.e. dark grey), it can be deemed to be an important covariate in the occupancy model. If it is between 0.25 and 0.75 (i.e. light grey), then it is uncertain. Finally, if it is <0.25 it is unimportant.
+
+
+```{r}
+# format data for plotting
+water.fitted   <- apply(out$BUGSoutput$sims.list$ind.water,2,mean)
+water.lower.CI <- apply(out$BUGSoutput$sims.list$ind.water,2,quantile,probs=0.025)
+water.upper.CI <- apply(out$BUGSoutput$sims.list$ind.water,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,water.fitted,
+     ylab="Proporion of water indicator",xlab="",xaxt = "n",
+     type ="p", ylim = c(0,1), 
+     pch=16,frame.plot = FALSE)
+rect(1, 1,nspecies,   0.75,col="#888888", lty=0)
+rect(1, 0.75,nspecies,   0.25,col= "grey", lty=0)
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,water.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,water.lower.CI,1:nspecies,water.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+
+```
+
+
+
+### Proportion of cell covered in water
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(13,4,1,1))
+```
+
+
+
+#### Beta
+
+```{r}
+
+# format data for plotting
+inflow.fitted   <- apply(out$BUGSoutput$sims.list$beta.inflow,2,mean)
+inflow.lower.CI <- apply(out$BUGSoutput$sims.list$beta.inflow,2,quantile,probs=0.025)
+inflow.upper.CI <- apply(out$BUGSoutput$sims.list$beta.inflow,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,inflow.fitted,
+     ylab="Volume of water flowing into cell slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:nspecies, rep(0,nspecies),col="red")
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,inflow.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,inflow.lower.CI,1:nspecies,inflow.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Theta
+
+```{r}
+# format data for plotting
+inflow.fitted   <- apply(out$BUGSoutput$sims.list$theta.inflow,2,mean)
+inflow.lower.CI <- apply(out$BUGSoutput$sims.list$theta.inflow,2,quantile,probs=0.025)
+inflow.upper.CI <- apply(out$BUGSoutput$sims.list$theta.inflow,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,inflow.fitted,
+     ylab="Volume of water flowing into cell slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:nspecies, rep(0,nspecies),col="red")
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,inflow.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,inflow.lower.CI,1:nspecies,inflow.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Indicator
+
+```{r}
+# format data for plotting
+inflow.fitted   <- apply(out$BUGSoutput$sims.list$ind.inflow,2,mean)
+inflow.lower.CI <- apply(out$BUGSoutput$sims.list$ind.inflow,2,quantile,probs=0.025)
+inflow.upper.CI <- apply(out$BUGSoutput$sims.list$ind.inflow,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,inflow.fitted,
+     ylab="Volume of water flowing into cell indicator",xlab="",xaxt = "n",
+     type ="p", ylim = c(0,1), 
+     pch=16,frame.plot = FALSE)
+rect(1, 1,nspecies,   0.75,col="#888888", lty=0)
+rect(1, 0.75,nspecies,   0.25,col= "grey", lty=0)
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,inflow.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,inflow.lower.CI,1:nspecies,inflow.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+
+
+```
+
+### Proportion of cell covered in bog
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(13,4,1,1))
+```
+
+#### Beta
+
+```{r}
+# format data for plotting
+bog.fitted   <- apply(out$BUGSoutput$sims.list$beta.bog,2,mean)
+bog.lower.CI <- apply(out$BUGSoutput$sims.list$beta.bog,2,quantile,probs=0.025)
+bog.upper.CI <- apply(out$BUGSoutput$sims.list$beta.bog,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,bog.fitted,
+     ylab="Bog slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-5,5), 
+     pch=16,frame.plot = FALSE)
+lines(1:nspecies, rep(0,nspecies),col="red")
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,bog.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,bog.lower.CI,1:nspecies,bog.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Theta
+
+```{r}
+# format data for plotting
+bog.fitted   <- apply(out$BUGSoutput$sims.list$theta.bog,2,mean)
+bog.lower.CI <- apply(out$BUGSoutput$sims.list$theta.bog,2,quantile,probs=0.025)
+bog.upper.CI <- apply(out$BUGSoutput$sims.list$theta.bog,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,bog.fitted,
+     ylab="Bog slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:nspecies, rep(0,nspecies),col="red")
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,bog.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,bog.lower.CI,1:nspecies,bog.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Indicator
+
+```{r}
+# format data for plotting
+bog.fitted   <- apply(out$BUGSoutput$sims.list$ind.bog,2,mean)
+bog.lower.CI <- apply(out$BUGSoutput$sims.list$ind.bog,2,quantile,probs=0.025)
+bog.upper.CI <- apply(out$BUGSoutput$sims.list$ind.bog,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,bog.fitted,
+     ylab="Bog indicator",xlab="",xaxt = "n",
+     type ="p", ylim = c(0,1), 
+     pch=16,frame.plot = FALSE)
+rect(1, 1,nspecies,   0.75,col="#888888", lty=0)
+rect(1, 0.75,nspecies,   0.25,col= "grey", lty=0)
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:nspecies,bog.fitted,
+       type ="p", 
+       pch=16)
+segments(1:nspecies,bog.lower.CI,1:nspecies,bog.upper.CI)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+
+```
+
+## Breeding habitat effect on habitat preference (trait used to group species)
+
+### Volume of water flowing into cell
+
+```{r}
+
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(13,4,1,1))
+```
+
+#### Beta
+
+```{r}
+# format data for plotting
+inflow.fitted   <- apply(out$BUGSoutput$sims.list$beta.inflow.habitat,2,mean)
+inflow.lower.CI <- apply(out$BUGSoutput$sims.list$beta.inflow.habitat,2,quantile,probs=0.025)
+inflow.upper.CI <- apply(out$BUGSoutput$sims.list$beta.inflow.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),inflow.fitted,
+     ylab="Volume of water flowing into cell slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:length(levels(factor(traits$breeding_habitat))),
+      rep(0,length(levels(factor(traits$breeding_habitat)))),col="red")
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),inflow.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),inflow.lower.CI,1:length(levels(factor(traits$breeding_habitat))),inflow.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Theta
+
+```{r}
+# format data for plotting
+inflow.fitted   <- apply(out$BUGSoutput$sims.list$theta.inflow.habitat,2,mean)
+inflow.lower.CI <- apply(out$BUGSoutput$sims.list$theta.inflow.habitat,2,quantile,probs=0.025)
+inflow.upper.CI <- apply(out$BUGSoutput$sims.list$theta.inflow.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),inflow.fitted,
+     ylab="Volume of water flowing into cell slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:length(levels(factor(traits$breeding_habitat))),
+      rep(0,length(levels(factor(traits$breeding_habitat)))),col="red")
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),inflow.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),inflow.lower.CI,1:length(levels(factor(traits$breeding_habitat))),inflow.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Indicator
+
+```{r}
+# format data for plotting
+inflow.fitted   <- apply(out$BUGSoutput$sims.list$ind.inflow.habitat,2,mean)
+inflow.lower.CI <- apply(out$BUGSoutput$sims.list$ind.inflow.habitat,2,quantile,probs=0.025)
+inflow.upper.CI <- apply(out$BUGSoutput$sims.list$ind.inflow.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),inflow.fitted,
+     ylab="Volume of water flowing into cell indicator",xlab="",xaxt = "n",
+     type ="p", ylim = c(0,1), 
+     pch=16,frame.plot = FALSE)
+rect(1, 1,length(levels(factor(traits$breeding_habitat))),   0.75,col="#888888", lty=0)
+rect(1, 0.75,length(levels(factor(traits$breeding_habitat))),   0.25,col= "grey", lty=0)
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),inflow.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),inflow.lower.CI,1:length(levels(factor(traits$breeding_habitat))),inflow.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+
+```
+
+
+### Proportion of cell covered in water
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(13,4,1,1))
+```
+
+#### Beta
+
+```{r}
+
+# format data for plotting
+water.fitted   <- apply(out$BUGSoutput$sims.list$beta.water.habitat,2,mean)
+water.lower.CI <- apply(out$BUGSoutput$sims.list$beta.water.habitat,2,quantile,probs=0.025)
+water.upper.CI <- apply(out$BUGSoutput$sims.list$beta.water.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),
+     water.fitted,
+     ylab="Proporion of water slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:length(levels(factor(traits$breeding_habitat))),
+      rep(0,length(levels(factor(traits$breeding_habitat)))),col="red")
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),water.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),water.lower.CI,1:length(levels(factor(traits$breeding_habitat))),water.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+
+```
+
+#### Theta
+
+```{r}
+# format data for plotting
+water.fitted   <- apply(out$BUGSoutput$sims.list$theta.water.habitat,2,mean)
+water.lower.CI <- apply(out$BUGSoutput$sims.list$theta.water.habitat,2,quantile,probs=0.025)
+water.upper.CI <- apply(out$BUGSoutput$sims.list$theta.water.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),water.fitted,
+     ylab="Proporion of water slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:length(levels(factor(traits$breeding_habitat))),
+      rep(0,length(levels(factor(traits$breeding_habitat)))),col="red")
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),water.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),water.lower.CI,1:length(levels(factor(traits$breeding_habitat))),water.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Indicator
+
+```{r}
+# format data for plotting
+water.fitted   <- apply(out$BUGSoutput$sims.list$ind.water.habitat,2,mean)
+water.lower.CI <- apply(out$BUGSoutput$sims.list$ind.water.habitat,2,quantile,probs=0.025)
+water.upper.CI <- apply(out$BUGSoutput$sims.list$ind.water.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),water.fitted,
+     ylab="Proporion of water indicator",xlab="",xaxt = "n",
+     type ="p", ylim = c(0,1), 
+     pch=16,frame.plot = FALSE)
+rect(1, 1,length(levels(factor(traits$breeding_habitat))),   0.75,col="#888888", lty=0)
+rect(1, 0.75,length(levels(factor(traits$breeding_habitat))),   0.25,col= "grey", lty=0)
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),water.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),water.lower.CI,1:length(levels(factor(traits$breeding_habitat))),water.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+
+```
+
+
+
+### Proportion of bog in the cell  
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(13,4,1,1))
+
+```
+#### Beta
+
+```{r}
+# format data for plotting
+bog.fitted   <- apply(out$BUGSoutput$sims.list$beta.bog.habitat,2,mean)
+bog.lower.CI <- apply(out$BUGSoutput$sims.list$beta.bog.habitat,2,quantile,probs=0.025)
+bog.upper.CI <- apply(out$BUGSoutput$sims.list$beta.bog.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),bog.fitted,
+     ylab="Bog slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-5,5), 
+     pch=16,frame.plot = FALSE)
+lines(1:length(levels(factor(traits$breeding_habitat))),
+      rep(0,length(levels(factor(traits$breeding_habitat)))),col="red")
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),bog.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),bog.lower.CI,1:length(levels(factor(traits$breeding_habitat))),bog.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+#### Theta
+
+```{r}
+# format data for plotting
+bog.fitted   <- apply(out$BUGSoutput$sims.list$theta.bog.habitat,2,mean)
+bog.lower.CI <- apply(out$BUGSoutput$sims.list$theta.bog.habitat,2,quantile,probs=0.025)
+bog.upper.CI <- apply(out$BUGSoutput$sims.list$theta.bog.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),bog.fitted,
+     ylab="Bog slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-10,10), 
+     pch=16,frame.plot = FALSE)
+lines(1:length(levels(factor(traits$breeding_habitat))),
+      rep(0,length(levels(factor(traits$breeding_habitat)))),col="red")
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),bog.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),bog.lower.CI,1:length(levels(factor(traits$breeding_habitat))),bog.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+
+```
+
+#### Indicator
+
+```{r}
+# format data for plotting
+bog.fitted   <- apply(out$BUGSoutput$sims.list$ind.bog.habitat,2,mean)
+bog.lower.CI <- apply(out$BUGSoutput$sims.list$ind.bog.habitat,2,quantile,probs=0.025)
+bog.upper.CI <- apply(out$BUGSoutput$sims.list$ind.bog.habitat,2,quantile,probs=0.975)
+
+# plot
+plot(1:length(levels(factor(traits$breeding_habitat))),bog.fitted,
+     ylab="Bog indicator",xlab="",xaxt = "n",
+     type ="p", ylim = c(0,1), 
+     pch=16,frame.plot = FALSE)
+rect(1, 1,length(levels(factor(traits$breeding_habitat))),   0.75,col="#888888", lty=0)
+rect(1, 0.75,length(levels(factor(traits$breeding_habitat))),   0.25,col= "grey", lty=0)
+axis(1, at=1:length(levels(factor(traits$breeding_habitat))),labels=levels(factor(traits$breeding_habitat)),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:length(levels(factor(traits$breeding_habitat))),bog.fitted,
+       type ="p", 
+       pch=16)
+segments(1:length(levels(factor(traits$breeding_habitat))),bog.lower.CI,1:length(levels(factor(traits$breeding_habitat))),bog.upper.CI)
+mtext("Breeding habitat type", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+## Plot detection probability
+
+```{r}
+# Set it back to one plot per screen
+par(mfrow = c( 1, 1), mar = c(9,4,1,1))
+
+# format data for plotting
+p.fitted <- apply(out$BUGSoutput$sims.list$pdet.alpha,2,mean)
+p.lower.CI<-apply(out$BUGSoutput$sims.list$pdet.alpha,2,quantile,probs=0.025)
+p.upper.CI <-apply(out$BUGSoutput$sims.list$pdet.alpha,2,quantile,probs=0.975)
+
+# plot
+plot(1:nspecies,p.fitted,
+     ylab="Detection probabilty",xlab="",xaxt = "n",
+     type ="p", ylim=c(0,1), 
+     pch=16,frame.plot = FALSE)
+segments(1:nspecies,p.lower.CI,1:nspecies,p.upper.CI)
+axis(1, at=1:nspecies,labels=taxa_name,
+     las=2, cex.axis=0.7, tck=-.04)
+mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+
+# ## This bit of code sorts them according to dragonfly size
+#
+# sizes <- data.frame(traits$taxa,traits$Body_size_median,p.fitted,p.lower.CI,p.upper.CI)
+# sizes <- sizes[order(sizes$traits.Body_size_median, decreasing = TRUE),]
+# 
+# # plot
+# plot(1:nspecies,sizes$p.fitted,
+#      ylab="Detection probabilty",xlab="",xaxt = "n",
+#      type ="p", ylim=c(0,1), 
+#      pch=16,frame.plot = FALSE)
+# segments(1:nspecies,sizes$p.lower.CI,1:nspecies,sizes$p.upper.CI)
+# axis(1, at=1:nspecies,labels=sizes$traits.taxa,
+#      las=2, cex.axis=0.7, tck=-.04)
+# mtext("Species", side=1, line=7.3, cex.lab=3,las=1)
+```
+
+## Detection probability covariates
+
+```{r}
+par(mfrow = c( 1, 1), c(13,4,1,1))
+
+# List length
+LL.fitted   <- apply(out$BUGSoutput$sims.list$plistlength,2,mean) 
+LL.lower.CI <- apply(out$BUGSoutput$sims.list$plistlength,2,quantile,probs=0.025)
+LL.upper.CI <- apply(out$BUGSoutput$sims.list$plistlength,2,quantile,probs=0.975)
+
+# Number of visits
+VV.fitted   <- apply(out$BUGSoutput$sims.list$pvisitlength,2,mean) 
+VV.lower.CI <- apply(out$BUGSoutput$sims.list$pvisitlength,2,quantile,probs=0.025)
+VV.upper.CI <- apply(out$BUGSoutput$sims.list$pvisitlength,2,quantile,probs=0.975)
+
+# Dragonfly size
+size.fitted   <- apply(out$BUGSoutput$sims.list$psize,2,mean) 
+size.lower.CI <- apply(out$BUGSoutput$sims.list$psize,2,quantile,probs=0.025)
+size.upper.CI <- apply(out$BUGSoutput$sims.list$psize,2,quantile,probs=0.975)
+
+# Duration of flight period
+flight.fitted   <- apply(out$BUGSoutput$sims.list$pflight,2,mean) 
+flight.lower.CI <- apply(out$BUGSoutput$sims.list$pflight,2,quantile,probs=0.025)
+flight.upper.CI <- apply(out$BUGSoutput$sims.list$pflight,2,quantile,probs=0.975)
+
+# Put them all together for plotting
+MEAN  = c(LL.fitted ,VV.fitted, size.fitted, flight.fitted)
+LOWER = c(LL.lower.CI ,VV.lower.CI, size.lower.CI, flight.lower.CI)
+UPPER = c(LL.upper.CI ,VV.upper.CI, size.upper.CI, flight.upper.CI)
+
+# Plot
+plot(1:4,rep(25,4),
+     ylab="Slope parameter",xlab="",xaxt = "n",
+     type ="p", ylim = c(-5,5), 
+     pch=16,frame.plot = FALSE)
+lines(1:4, c(0,0,0,0),col="red")
+axis(1, at=1:4,labels=c("List Length", "Number of visits", 
+                        "Dragonfly size", "Duration of flight period"),
+     las=2, cex.axis=0.7, tck=-.04)
+points(1:4,MEAN,
+       type ="p", 
+       pch=16)
+segments(1:4,LOWER,1:4,UPPER)
+mtext("Detection probability predictor variable", side=1, 
+      line=7.3, cex.lab=3,las=1)
+
+```
+
+## Plot maps of modelled vs observed data
+
+```{r}
+# Plot modelled and observed data side to side
+par( mfrow = c( 1, 2),mar=c(.2,.2,3.2,.2))
+
+# format data for plotting
+z.fitted<-apply(out$BUGSoutput$sims.list$z,c(2,3),mean)
+z.lower.CI<-apply(out$BUGSoutput$sims.list$z,c(2,3),quantile,probs=0.025)
+z.upper.CI <-apply(out$BUGSoutput$sims.list$z,c(2,3),quantile,probs=0.975)
+
+gridrefs = site_name
+
+for (i in 1:nspecies){
+
+  modelled = z.fitted[,i]
+  observed = Z[,i]
+  
+  ### Plot the modelled data
+  #plot uk outline
+  plot_GIS(UK$britain,fill='black',line='black', #ylim = c(0, 1100000), 
+           main = taxa_name[i],
+           xlim=c(298900,331100), grid.div = 1000, ylim=c(506900,568000),
+           new.window = FALSE, show.grid = FALSE,
+           show.axis = FALSE,xlab = "", ylab = "")
+  #plot number of dragonfly records
+  plotUK_gr_cats(gridrefs, modelled, leg_cex = 0.5, #att_col = heat.colors(max(records1)),
+                 breaks=seq(0,1,0.1),border = NA)
+  
+  ### Plot the observed data
+  #plot uk outline
+  plot_GIS(UK$britain,fill='black',line='black',#ylim = c(0, 1100000), 
+           xlim=c(298900,331100), grid.div = 1000,ylim=c(506900,568000),
+           new.window = FALSE, show.grid = FALSE,
+           show.axis = FALSE,xlab = "", ylab = "")
+  #plot number of dragonfly records
+  plotUK_gr_cats(gridrefs, observed, leg_cex = 0.5, #att_col = heat.colors(max(records1)),
+                 breaks=seq(0,1,0.1),border = NA)
+}
+
+```
+
+
+# Summarize posteriors
+
+```{r}
+options(width=120)
+print(out, dig = 3)
+write.table(x=out$BUGSoutput$summary,file=txt_filename,sep="\t")
+plot(out)
+traceplot(out, ask=FALSE)
+```
+
+
+
+## Save the data
+
+```{r}
+save(out, file = R_filename)
+```
+
+
+## Close PDF
+
+```{r}
+dev.off()
+```
+
+
